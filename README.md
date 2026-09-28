@@ -2,9 +2,9 @@
 
 This repository documents a Windows x64 reverse-engineering analysis of `jnic-3.7.0.jar` and includes a self-contained modified build, `jnic-3.7.0-YumeCloud.jar`.
 
-The analysis focused on JNIC's native implementation and license system: how the embedded native libraries are stored and loaded, where license validation occurs, how `jnic.licence` is processed, how activation and HWID generation work, and how the engine behaves when its native code is modified during startup.
+The analysis focused on JNIC's native implementation and license system: how the embedded native libraries are stored and loaded, where license validation occurs, how `jnic.licence` is processed, how activation and HWID generation work, how the engine validates its own JAR records and its launch environment, how the instruction translators are registered, and how the engine behaves when its native code is modified during startup.
 
-The investigation ultimately identified the native license factory and demonstrated that it can be replaced after JNIC completes its integrity-sensitive initialization while allowing the remainder of the application to execute normally.
+The investigation ultimately identified the native license factory and demonstrated that it can be replaced after JNIC completes its integrity-sensitive initialization while allowing the remainder of the application to execute normally. The package was later extended with two further runtime fixes so that it completes full protection runs, not just the license stage.
 
 ## Target
 
@@ -15,9 +15,11 @@ The investigation ultimately identified the native license factory and demonstra
 | Size                | 6,872,306 bytes                                                    |
 | Original main class | `dev.jnic.be`                                                      |
 | Modified JAR        | `jnic-3.7.0-YumeCloud.jar`                                         |
-| SHA-256             | `3746E7C43601A0F57E6DE36EDA61E601E59753F33A7A8028D47FFEB3EEDD770D` |
+| SHA-256             | `5792698D7553F7902C2BF78CD76C263463D3A60F1A6C0242B6AB32E4544EDE5D` |
+| Size                | 6,934,698 bytes                                                    |
 | Target platform     | Windows x64                                                        |
-| Java version used   | JDK 17.0.10                                                        |
+| Java version used   | JDK 17 (Temurin 17.0.20)                                           |
+| Zig version         | 0.11.0                                                             |
 
 The modified package is specific to the analyzed JNIC 3.7.0 Windows x64 engine. Native addresses and implementation details documented below should not be assumed to apply to other JNIC releases.
 
@@ -26,24 +28,47 @@ The modified package is specific to the analyzed JNIC 3.7.0 Windows x64 engine. 
 Requirements:
 
 * Windows x64
-* Java 17
+* Java 17 (tested with Temurin 17.0.20; Java 21 also works)
+* Zig 0.11.0 extracted next to the JAR (`zig-windows-x86_64-0.11.0\zig.exe`)
 
 Run the modified package:
 
 ```powershell
-java -jar .\jnic-3.7.0-YumeCloud.jar
+java -jar .\jnic-3.7.0-YumeCloud.jar <input.jar> <output.jar> <config.xml>
 ```
 
-Expected license-stage output:
+Example:
+
+```powershell
+java -jar .\jnic-3.7.0-YumeCloud.jar .\SnakeGame.jar out.jar .\config.xml
+```
+
+Expected output:
 
 ```text
+JNIC Java Obfuscator 3.7.0
+ ~ (c) +Vincent Tang 2020-2023
+
 INFO: Licence: YumeCloud (standard)
 INFO: Expires: 8888-88-88
+INFO: Found compiler: ...\zig-windows-x86_64-0.11.0\zig.exe
+INFO: Reading input jar .\SnakeGame.jar
+INFO: Reading configuration file .\config.xml
+INFO: Analysing classes...
+INFO: Translating 19 methods in 7 classes
+INFO: Saving translated sources
+INFO: Compiling sources
+INFO: Finished compilation
+INFO: Compressing native libraries (total size: 325.7 KiB) (preset: 6)
+INFO: Compressed size: 60.6 KiB
+INFO: Preparing output JAR file
+INFO: Writing to file out.jar
+INFO: Terminating normally.
 ```
 
 The package does not require an external Frida session, Python, or a `jnic.licence` file.
 
-If execution continues to compiler discovery and reports `No usable compiler found`, that is a separate JNIC compiler dependency rather than a license failure.
+If the run reports `No usable compiler found`, Zig was not found next to the JAR.
 
 ---
 
@@ -774,6 +799,13 @@ YumeCloud/Patcher.class
 YumeCloud/YumeCloud.dll
 ```
 
+`YumeCloud/YumeCloud.dll` is a single combined helper that exports both runtime patches:
+
+| Export                                | Purpose                            |
+| ------------------------------------- | ---------------------------------- |
+| `Java_YumeCloud_Patcher_install`      | native license factory replacement |
+| `Java_YumeCloud_Launcher_patchEngine` | `bk` JAR-record validation bypass  |
+
 The launcher is responsible for reproducing the successful patch timing discovered during the dynamic analysis.
 
 Its execution sequence is:
@@ -789,7 +821,11 @@ extract YumeCloud/YumeCloud.dll
         ↓
 System.load(...)
         ↓
-YumeCloud.Patcher.install()
+patchEngine()                  (bk throw bypass)
+        ↓
+YumeCloud.Patcher.install()    (license factory replacement)
+        ↓
+rebuildTranslators()           (dev.jnic.k.i)
         ↓
 dev.jnic.be.main(args)
 ```
@@ -800,17 +836,19 @@ The important operation is:
 Class.forName("dev.jnic.be");
 ```
 
-before the helper is installed.
+before any helper is installed.
 
 This forces JNIC's class and native initialization to complete while the engine is still unmodified.
 
-Only afterward is the runtime replacement installed.
+Only afterward are the runtime modifications installed.
 
 ---
 
 ## Runtime Replacement
 
 `YumeCloud.dll` locates the temporary Windows engine loaded by `JNICLoader`.
+
+The same helper also installs the `bk` bypass (see Additional Engine Fixes below) and is loaded only once by the launcher.
 
 The helper searches the loaded modules for the temporary engine and calculates the factory address using:
 
@@ -902,6 +940,8 @@ The other observed edition values are:
 3 -> evaluation
 ```
 
+The three strings can be overridden with the `JNIC_HOLDER`, `JNIC_EXPIRY` and `JNIC_EDITION` environment variables; the defaults are `YumeCloud`, `8888-88-88` and `1`.
+
 From the perspective of the remainder of `be.main`, the factory returned the Java type and metadata it expected.
 
 Execution therefore continues through the normal license display and compiler-discovery code rather than terminating at the original license failure.
@@ -925,6 +965,109 @@ post-initialization runtime modification
 The original embedded engine is allowed to initialize normally before its license factory is changed in memory.
 
 No external Frida or Python process is required during normal execution.
+
+---
+
+## Additional Engine Fixes
+
+Replacing the license factory is enough for the license stage, but a **full protection run** requires two further fixes that were found by tracing the engine's startup path.
+
+### JAR Record Validation (`bk`)
+
+JNIC stores a per-entry record in the ZIP **extra field** of every entry of its own JAR:
+
+```text
+header id: 0x6E6A  ("jn@")
+length:    64 bytes
+```
+
+At `dev.jnic.bk` class initialization the engine scans its own JAR entry by entry:
+
+```text
+File(URI)
+        ↓
+FileInputStream
+        ↓
+ZipInputStream
+        ↓
+getNextEntry()
+        ↓
+ZipEntry.getExtra()
+        ↓
+ZipInputStream.readAllBytes()
+        ↓
+record validation
+```
+
+The first entry whose record is missing or does not match aborts the scan with a plain `java.io.IOException`, which surfaces as:
+
+```text
+java.lang.ExceptionInInitializerError
+Caused by: java.io.IOException
+        at dev.jnic.bk.$jnicLoader(Native Method)
+        at dev.jnic.bk.<clinit>(bk.java)
+```
+
+Repackaging the JAR damages these records: the JDK `jar` tool prepends an empty `0xCAFE` extra field to the first entry, drops the extras of `META-INF/MANIFEST.MF` and `META-INF/versions/9/module-info.class`, and newly added entries have no record at all.
+
+The modified package keeps every original entry, but the changed manifest and the added `YumeCloud/*` entries cannot carry valid records, so the three throw sites inside the engine are replaced with NOPs:
+
+| Purpose                      | Engine RVA |
+| ---------------------------- | ---------: |
+| `bk` record validation throw | `0x17d9b`  |
+| `bk` record validation throw | `0x17db0`  |
+| `bk` record validation throw | `0x18168`  |
+
+### Translator Registry (`dev.jnic.k.i`)
+
+`dev.jnic.k` holds the instruction translators used by the Java → native translation stage:
+
+```java
+public static Set<az> h;
+public static Set<az> i;
+```
+
+In the patched state the engine leaves the second registry empty, and the first registry only contains five generic translators (`dev.jnic.{s,t,u,v,w}`) that match no instruction, so translation stops on the first opcode with:
+
+```text
+Exception in thread "main" dev.jnic.b9: No translator found for ALOAD 0
+        at dev.jnic.k.<init>(k.java:29)
+        at dev.jnic.be.main(Native Method)
+```
+
+The real translators are 19 classes in the `dev.jnic` package:
+
+```text
+dev.jnic.{a1, a7, a8, aa, ac, ae, ah, ai, ak, al, am, as, ap, av, aq, at, aw, ax, z}
+```
+
+The launcher therefore force-initializes `dev.jnic.k` and rebuilds `i`:
+
+```text
+Class.forName("dev.jnic.k")
+        ↓
+k.<clinit> → k.$jnicClinit (engine RVA 0x121c7c)
+        ↓
+new LinkedHashSet()
+        ↓
+one instance of each of the 19 translator classes
+        ↓
+dev.jnic.k.i = rebuilt set
+```
+
+Rebuilding at (or after) the completion of `dev.jnic.k.$jnicClinit` is what makes the translation stage succeed.
+
+### Launch Environment Validation
+
+The native engine validates how it was started and only accepts an invocation of the form:
+
+```text
+java.exe -jar <jnic.jar> <args...>
+```
+
+`-cp`, `-javaagent`, `-agentlib`, `-agentpath` or a launcher with a different image name make the engine corrupt its own bootstrap state during `be.$jnicLoader` (`CallStaticObjectMethod(NULL, NULL)`), which crashes the JVM. `-D` and `-X` options are accepted.
+
+The modified package therefore keeps the normal `java -jar` launch and performs every modification from inside the process, after JNIC's initialization has completed.
 
 ---
 
@@ -956,6 +1099,14 @@ runtime experiments
 license factory identification
         ↓
 patch-timing experiments
+        ↓
+JAR extra-field record analysis
+        ↓
+translator registry inspection
+        ↓
+launch-environment experiments
+        ↓
+full protection run validation
 ```
 
 The historical dynamic analysis used Frida 17.17.0 with Java 17.
@@ -994,6 +1145,8 @@ This approach allowed high-level Java operations to be correlated with execution
 
 It was especially useful for recovering the license-file parser, activation request, HWID calculation, string decryption, TLS verification, and the fields contained by the `a3` license object.
 
+The full-run fixes were located the same way: the JAR-record scan was traced through its `ZipInputStream` / `ZipEntry.getExtra` calls until the `java.io.IOException` throw sites were found, and the translator registry was inspected by reading the static sets of `dev.jnic.k` at the point where the engine aborted on the first opcode.
+
 ---
 
 ## Limitations
@@ -1004,17 +1157,22 @@ This analysis and the modified package apply specifically to:
 JNIC 3.7.0
 Windows x64
 Java 17
+Zig 0.11.0
 ```
 
-The factory RVA:
+The patch sites:
 
 ```text
-0x4818d8
+0x4818d8   native license factory (a3.e)
+0x17d9b    bk record validation throw
+0x17db0    bk record validation throw
+0x18168    bk record validation throw
+0x121c7c   dev.jnic.k.$jnicClinit (translator rebuild timing)
 ```
 
-belongs to the analyzed JNIC 3.7.0 Windows x64 engine.
+belong to the analyzed JNIC 3.7.0 Windows x64 engine.
 
-A different JNIC version may change the engine layout, function implementation, initialization behavior, or ABI and should not be expected to work with the same address.
+A different JNIC version may change the engine layout, function implementation, initialization behavior, or ABI and should not be expected to work with the same addresses.
 
 Several aspects of the original license implementation remain unresolved:
 
@@ -1031,9 +1189,11 @@ The replacement currently supplies:
 
 as the expiry value.
 
-This value is accepted and displayed by the tested startup path, but it is not a valid calendar date. A separate code path that strictly parses the value as a date could therefore behave differently.
+This value is accepted and displayed by the tested startup path, including full protection runs, but it is not a valid calendar date. A separate code path that strictly parses the value as a date could therefore behave differently.
 
-The helper also modifies executable memory at runtime. Security software, a different Java runtime, or changes to the native engine may prevent the package from behaving as tested.
+The engine also performs its own launch-environment validation and only accepts a `java.exe -jar <jnic.jar> ...` invocation, and its compiler discovery expects Zig next to the JAR.
+
+The helper modifies executable memory at runtime. Security software, a different Java runtime, or changes to the native engine may prevent the package from behaving as tested.
 
 ---
 
@@ -1053,7 +1213,9 @@ The original license system reads a slash-separated license value, performs addi
 
 Runtime experiments further showed that modifying the engine immediately after loading interferes with its integrity-sensitive initialization. Replacing the factory after initialization, but before the direct license call, avoids that behavior.
 
-`jnic-3.7.0-YumeCloud.jar` packages this result into a self-contained Windows x64 JAR. Its launcher first allows JNIC to initialize normally, then loads an embedded helper that redirects the native license factory and constructs:
+Two further findings were required for complete protection runs. First, `dev.jnic.bk` validates a 64-byte `jn@` record stored in the ZIP extra field of every JAR entry, and repackaging the JAR damages those records; the three throw sites in the engine are therefore NOPed. Second, the engine leaves the translator registry `dev.jnic.k.i` empty, which aborts translation with `No translator found`; the launcher rebuilds it with the 19 translator classes after `dev.jnic.k` is initialized.
+
+`jnic-3.7.0-YumeCloud.jar` packages this result into a self-contained Windows x64 JAR. Its launcher first allows JNIC to initialize normally, then loads a single embedded helper that redirects the native license factory, bypasses the JAR-record validation throws and rebuilds the translator registry, constructing:
 
 ```text
 holder  = YumeCloud
@@ -1066,6 +1228,17 @@ The original `be.main` therefore receives the expected `dev/jnic/a3` object and 
 ```text
 INFO: Licence: YumeCloud (standard)
 INFO: Expires: 8888-88-88
+```
+
+and then completes a normal protection run:
+
+```text
+INFO: Translating N methods in M classes
+INFO: Saving translated sources
+INFO: Compiling sources
+INFO: Finished compilation
+INFO: Writing to file <output.jar>
+INFO: Terminating normally.
 ```
 
 without requiring an external Frida or Python session during normal execution.
